@@ -9,6 +9,8 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 
+#define LOG_PRINT_TIMING 0
+
 constexpr auto LCD_LOG_TAG = "LCD";
 constexpr auto CHIP8_LOG_TAG = "Chip8";
 
@@ -194,7 +196,7 @@ DRAM_ATTR static const uint8_t lcd_pos_gamma_ctrl_cmd[] = {0xD0, 0x00, 0x05, 0x0
 DRAM_ATTR static const uint8_t lcd_neg_gamma_ctrl_cmd[] = {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D,
                                                            0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19};
 
-constexpr uint16_t LCD_PARALLEL_LINES = 64;
+constexpr uint16_t LCD_PARALLEL_LINES = 80;
 constexpr uint16_t LCD_WIDTH = 240;
 constexpr uint16_t LCD_HEIGHT = 320;
 
@@ -384,100 +386,33 @@ static void lcd_draw_task(void* arg) {
 
     // TODO this has a resolution too low, maybe use some kind of busy wait (esp_cpu_get_cycle_count()),
     // configCPU_CLOCK_HZ
-    static_assert(configTICK_RATE_HZ == 60, "The FreeRTOS frequency shold be set to 60Hz");
+    static_assert(configTICK_RATE_HZ == 120, "The FreeRTOS frequency shold be set to 120Hz");
     TickType_t frequency = pdMS_TO_TICKS(1000) / 60;
     TickType_t last_wake_time = xTaskGetTickCount();
+
+    bool waiting_for_touch = false;
+    spi_transaction_t touch_tr_x = {};
+    spi_transaction_t touch_tr_y = {};
+
+#if LOG_PRINT_TIMING
+    uint32_t begin_update, end_update;
+    begin_update = esp_cpu_get_cycle_count();
+#endif
     for (;;) {
         BaseType_t was_delayed = xTaskDelayUntil(&last_wake_time, frequency);
-        if (was_delayed) {
+        if (!was_delayed) {
             ESP_LOGE(LCD_LOG_TAG, "Frame missed!");
             last_wake_time = xTaskGetTickCount();
         }
 
+#if LOG_PRINT_TIMING
+        end_update = esp_cpu_get_cycle_count();
+        printf("%.4fms\n", (end_update - begin_update) / (float)160000);
+        begin_update = end_update;
+#endif
+
         atomic_decrement_if_positive(&chip8_delay_timer_register);
         atomic_decrement_if_positive(&chip8_sound_timer_register);
-
-        {
-            uint16_t x_raw = touch_read_value(touch, Touch_Value_Index::AXIS_X);
-            uint16_t y_raw = touch_read_value(touch, Touch_Value_Index::AXIS_Y);
-
-            if (x_raw >= 130 && x_raw <= 1930 && y_raw >= 210 && y_raw <= 1960) {
-                touch_x = 239 - (((x_raw - 130) * 239) / (1920 - 130));
-                touch_y = 319 - (((y_raw - 210) * 319) / (1960 - 210));
-                if (!touch_pressed) {
-                    int16_t x = (touch_x - 56) >> 5;
-                    int16_t y = (touch_y - 160) >> 5;
-                    if (x >= 0 && x < 4 && y >= 0 && y < 4) {
-                        __atomic_store_n(&chip8_button_pressed, x + y * 4, __ATOMIC_RELEASE);
-                        vTaskResume(chip8_task_handle);
-                    }
-                }
-                touch_pressed = true;
-            } else {
-                if (touch_pressed) {
-                    __atomic_store_n(&chip8_button_pressed, 0x10, __ATOMIC_RELEASE);
-                }
-                touch_pressed = false;
-            }
-        }
-
-        {
-            uint16_t* line = frame_buffer;
-            for (uint16_t y = 0; y < LCD_HEIGHT; y++) {
-                uint16_t* pixel = line;
-                for (uint16_t x = 0; x < LCD_WIDTH; x++, ++pixel) {
-                    *pixel = 0;
-                }
-                line += LCD_WIDTH;
-            }
-
-            line = frame_buffer + (23 * LCD_WIDTH);
-            {
-                uint16_t* pixel = line + 23;
-                for (uint16_t x = 0; x < 194; x++) {
-                    *pixel++ = 0b1000010000010000;
-                }
-                line += LCD_WIDTH;
-            }
-            for (uint16_t y = 0; y < 96; y++) {
-                uint16_t* pixel = line + 23;
-                *pixel++ = 0b1000010000010000;
-                uint16_t chip8_y = y / 3;
-                for (uint16_t x = 0; x < 192; x++) {
-                    uint16_t chip8_x = x / 3;
-                    *pixel++ = chip8_screen[chip8_x + chip8_y * 64] ? 0b0000011111100000 : 0b0000000000000000;
-                }
-                *pixel++ = 0b1000010000010000;
-                line += LCD_WIDTH;
-            }
-            {
-                uint16_t* pixel = line + 23;
-                for (uint16_t x = 0; x < 194; x++) {
-                    *pixel++ = 0b1000010000010000;
-                }
-            }
-
-            uint16_t btn_x = chip8_button_pressed & 0b11;
-            uint16_t btn_y = chip8_button_pressed >> 2;
-            line = frame_buffer + (159 * LCD_WIDTH);
-            for (uint16_t y = 31; y < 130 + 31; y++) {
-                uint16_t* pixel = line + 55;
-                uint16_t row = (y >> 5) - 1;
-                uint16_t row_y = y & 0b11111;
-                for (uint16_t x = 31; x < 130 + 31; x++, ++pixel) {
-                    uint16_t row_x = x & 0b11111;
-                    uint16_t col = (x >> 5) - 1;
-                    if (row_y == 0 || row_y == 31 || row_x == 0 || row_x == 31) {
-                        *pixel = 0b1000010000010000;
-                    } else if (col == btn_x && row == btn_y) {
-                        *pixel = 0b0000000000011111;
-                    } else {
-                        *pixel = 0b0000000000000000;
-                    }
-                }
-                line += LCD_WIDTH;
-            }
-        }
 
         for (uint16_t n = 0; n < LCD_HEIGHT; n += LCD_PARALLEL_LINES) {
             uint16_t* transfer_buffer = transfer_buffers[transfer_buffer_index];
@@ -514,6 +449,55 @@ static void lcd_draw_task(void* arg) {
             spi_send_command_async(lcd, &send_data_transaction[4], 0x2C);
             spi_send_data_async(lcd, &send_data_transaction[5], LCD_WIDTH * sizeof(uint16_t) * LCD_PARALLEL_LINES,
                                 (uint8_t*)transfer_buffer);
+        }
+
+        if (waiting_for_touch) {
+            waiting_for_touch = false;
+            spi_transaction_t* rtrans;
+            esp_err_t ret = spi_device_get_trans_result(touch, &rtrans, portMAX_DELAY);
+            uint16_t x_raw =
+                (((uint16_t)rtrans->rx_data[1] & 0b01111111) << 4) | (((uint16_t)rtrans->rx_data[2] & 0b11110000) >> 4);
+
+            ret = spi_device_get_trans_result(touch, &rtrans, portMAX_DELAY);
+            uint16_t y_raw =
+                (((uint16_t)rtrans->rx_data[1] & 0b01111111) << 4) | (((uint16_t)rtrans->rx_data[2] & 0b11110000) >> 4);
+
+            // uint16_t x_raw = 0; //  touch_read_value(touch, Touch_Value_Index::AXIS_X);
+            // uint16_t y_raw = 0; //  touch_read_value(touch, Touch_Value_Index::AXIS_Y);
+
+            if (x_raw >= 130 && x_raw <= 1930 && y_raw >= 210 && y_raw <= 1960) {
+                touch_x = 239 - (((x_raw - 130) * 239) / (1920 - 130));
+                touch_y = 319 - (((y_raw - 210) * 319) / (1960 - 210));
+                if (!touch_pressed) {
+                    int16_t x = (touch_x - 56) >> 5;
+                    int16_t y = (touch_y - 160) >> 5;
+                    if (x >= 0 && x < 4 && y >= 0 && y < 4) {
+                        __atomic_store_n(&chip8_button_pressed, x + y * 4, __ATOMIC_RELEASE);
+                        vTaskResume(chip8_task_handle);
+                    }
+                }
+                touch_pressed = true;
+            } else {
+                if (touch_pressed) {
+                    __atomic_store_n(&chip8_button_pressed, 0x10, __ATOMIC_RELEASE);
+                }
+                touch_pressed = false;
+            }
+        }
+
+        {
+            waiting_for_touch = true;
+
+            touch_tr_x.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+            touch_tr_x.length = 24;
+            touch_tr_x.tx_data[0] = 0xD0;
+
+            touch_tr_y.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+            touch_tr_y.length = 24;
+            touch_tr_y.tx_data[0] = 0x90;
+
+            esp_err_t err = spi_device_queue_trans(touch, &touch_tr_x, portMAX_DELAY);
+            err = spi_device_queue_trans(touch, &touch_tr_y, portMAX_DELAY);
         }
     }
 }
@@ -581,15 +565,7 @@ static uint8_t chip8_button_map[16] = {
 #define CHIP8_LOG(...)
 #endif
 
-static void chip8_task(void* arg) {
-    {
-        // NOTE(Damiano): load rom
-        uint16_t rom_len = sizeof(chip8_rom);
-        for (uint16_t i = 0; i < rom_len; ++i) {
-            chip8_ram[0x200 + i] = chip8_rom[i];
-        }
-    }
-
+static void chip8_draw(void* arg) {
     {
         // NOTE(Damiano): Clear screen
         uint16_t* line = frame_buffer;
@@ -602,6 +578,69 @@ static void chip8_task(void* arg) {
         }
     }
 
+    for (;;) {
+        vTaskDelay(1);
+
+        uint16_t* line = frame_buffer + (23 * LCD_WIDTH);
+        {
+            uint16_t* pixel = line + 23;
+            for (uint16_t x = 0; x < 194; x++) {
+                *pixel++ = 0b1000010000010000;
+            }
+            line += LCD_WIDTH;
+        }
+        for (uint16_t y = 0; y < 96; y++) {
+            uint16_t* pixel = line + 23;
+            *pixel++ = 0b1000010000010000;
+            uint16_t chip8_y = y / 3;
+            for (uint16_t x = 0; x < 192; x++) {
+                uint16_t chip8_x = x / 3;
+                *pixel++ = chip8_screen[chip8_x + chip8_y * 64] ? 0b0000011111100000 : 0b0000000000000000;
+            }
+            *pixel++ = 0b1000010000010000;
+            line += LCD_WIDTH;
+        }
+        {
+            uint16_t* pixel = line + 23;
+            for (uint16_t x = 0; x < 194; x++) {
+                *pixel++ = 0b1000010000010000;
+            }
+        }
+
+        uint16_t btn_x = chip8_button_pressed & 0b11;
+        uint16_t btn_y = chip8_button_pressed >> 2;
+        line = frame_buffer + (159 * LCD_WIDTH);
+        for (uint16_t y = 31; y < 130 + 31; y++) {
+            uint16_t* pixel = line + 55;
+            uint16_t row = (y >> 5) - 1;
+            uint16_t row_y = y & 0b11111;
+            for (uint16_t x = 31; x < 130 + 31; x++, ++pixel) {
+                uint16_t row_x = x & 0b11111;
+                uint16_t col = (x >> 5) - 1;
+                if (row_y == 0 || row_y == 31 || row_x == 0 || row_x == 31) {
+                    *pixel = 0b1000010000010000;
+                } else if (col == btn_x && row == btn_y) {
+                    *pixel = 0b0000000000011111;
+                } else {
+                    *pixel = 0b0000000000000000;
+                }
+            }
+            line += LCD_WIDTH;
+        }
+    }
+}
+
+static void chip8_task(void* arg) {
+    {
+        // NOTE(Damiano): load rom
+        uint16_t rom_len = sizeof(chip8_rom);
+        for (uint16_t i = 0; i < rom_len; ++i) {
+            chip8_ram[0x200 + i] = chip8_rom[i];
+        }
+    }
+
+    xTaskCreatePinnedToCore(chip8_draw, "chip8_draw", 2048, NULL, 9, 0, 0);
+
     uint8_t regs[16] = {};
     uint16_t reg_I = 0;
     uint16_t pc = 0x200;
@@ -612,6 +651,7 @@ static void chip8_task(void* arg) {
     uint16_t running = false;
 #endif
     for (;;) {
+
 #if CHIP8_DEBUG
         if (button_pressed) {
             button_pressed = 0;
