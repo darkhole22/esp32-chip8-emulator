@@ -13,6 +13,4 @@ This is an implementation of a [chip8](https://en.wikipedia.org/wiki/CHIP-8) int
 
 ## TODO
 The project is not yet finished
-- [ ] Fix the timing of the delay timer register(s).
-- [ ] Draw the digits in the keypad
 - [ ] Add audio support
